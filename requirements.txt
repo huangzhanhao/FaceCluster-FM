@@ -1,0 +1,14 @@
+# FaceCluster-FM · M0 依赖（Python 3.12）
+numpy
+opencv-python
+Pillow
+ImageHash
+onnx
+# 钉版本：1.24.3+ 有 DML EP 枚举回归（1.30 实测无 DML）；
+# 且若环境里同时存在 onnxruntime 与 onnxruntime-directml 会互相覆盖，务必保持唯一
+onnxruntime-directml==1.24.4
+insightface
+
+# ---- M3 发型 + GUI ----
+tokenizers          # SigLIP2 tokenizer（仅模式 A 提示词预计算）
+PySide6             # 桌面 GUI（python -m facecluster.gui）

@@ -1,0 +1,13 @@
+/.trae
+/.venv
+/.vscode
+/.zcodeignore
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 运行产物与样本数据（内容哈希可随时重算，人脸图不入库）
+/out/
+/样本/
+/样本_sorted/

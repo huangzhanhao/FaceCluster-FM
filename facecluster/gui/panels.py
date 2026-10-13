@@ -1,0 +1,293 @@
+# -*- coding: utf-8 -*-
+"""控制面板与对话框：KeyOrderPanel / FValuePanel / ClusterPanel / HairstylePanel / RenameDialog。"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import (
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton,
+    QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+)
+
+from .. import rename
+from ..config import Config
+from .thumbs import ThumbStore
+
+
+class KeyOrderPanel(QWidget):
+    """分区键编辑：勾选 = 参与分区，拖拽 = 键序。任何变更即时发 keysChanged。"""
+
+    keysChanged = Signal(list)
+
+    def __init__(self, keys: list[str], selected: list[str], parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("分区键（勾选参与，拖拽排序）"))
+        self.listw = QListWidget()
+        self.listw.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.listw.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.listw.setFixedHeight(28 * (len(keys) + 1))
+        for k in keys:
+            it = QListWidgetItem(k)
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsDragEnabled)
+            it.setCheckState(Qt.Checked if k in selected else Qt.Unchecked)
+            self.listw.addItem(it)
+        self.listw.model().rowsMoved.connect(self._emit)
+        self.listw.itemChanged.connect(self._emit)
+        v.addWidget(self.listw)
+
+    def current_keys(self) -> list[str]:
+        return [self.listw.item(i).text() for i in range(self.listw.count())
+                if self.listw.item(i).checkState() == Qt.Checked]
+
+    def ensure_key(self, key: str) -> None:
+        """键纳入面板并勾选（无则追加）；勾选变更经 itemChanged → 自动重排。"""
+        for i in range(self.listw.count()):
+            if self.listw.item(i).text() == key:
+                if self.listw.item(i).checkState() != Qt.Checked:
+                    self.listw.item(i).setCheckState(Qt.Checked)
+                return
+        it = QListWidgetItem(key)
+        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsDragEnabled)
+        it.setCheckState(Qt.Checked)
+        self.listw.addItem(it)
+        self.listw.setFixedHeight(28 * (self.listw.count() + 1))
+
+    def _emit(self, *_):
+        self.keysChanged.emit(self.current_keys())
+
+
+class FValuePanel(QWidget):
+    """F 值（R11）：每级段内相邻 cos 之和 + 最差相邻对提示。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("F 值（越大段内越连贯）"))
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["级别", "键", "F 值", "段数"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setMaximumHeight(140)
+        v.addWidget(self.table)
+        self.worst = QLabel("")
+        self.worst.setWordWrap(True)
+        v.addWidget(self.worst)
+
+    def refresh(self, plan: dict):
+        f = plan.get("fvalue", {})
+        rows = f.get("per_level", [])
+        self.table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            for j, val in enumerate((f"L{r['level']}", "→".join(r["keys"]),
+                                     f"{r['f']:.1f}", str(r["n_seg"]))):
+                self.table.setItem(i, j, QTableWidgetItem(val))
+        wp = f.get("worst_pairs") or []
+        if wp:
+            w = wp[0]
+            self.worst.setText(
+                f"最差相邻对：{Path(w['a']).name} ↔ {Path(w['b']).name}（cos={w['sim']}）")
+        else:
+            self.worst.setText("")
+
+
+class ClusterPanel(QWidget):
+    """身份簇面板：medoid 代表图网格，多选合并 / 单选拆分(k=2)。"""
+
+    mergeRequested = Signal(list)
+    splitRequested = Signal(int)
+
+    def __init__(self, thumbs: ThumbStore, parent=None):
+        super().__init__(parent)
+        self.thumbs = thumbs
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("身份簇（多选→合并，单选→拆分）"))
+        self.listw = QListWidget()
+        self.listw.setViewMode(QListWidget.ViewMode.IconMode)
+        self.listw.setIconSize(QSize(72, 72))
+        self.listw.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.listw.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        v.addWidget(self.listw, 1)
+        h = QHBoxLayout()
+        self.merge_btn = QPushButton("合并选中")
+        self.split_btn = QPushButton("拆分(k=2)")
+        h.addWidget(self.merge_btn)
+        h.addWidget(self.split_btn)
+        v.addLayout(h)
+        self.merge_btn.clicked.connect(self._merge)
+        self.split_btn.clicked.connect(self._split)
+        thumbs.ready.connect(self._on_thumb)
+        self._meta: dict[int, tuple[int, str, str | None]] = {}
+
+    def refresh(self, clusters: list[dict]):
+        self.listw.clear()
+        self._meta = {}
+        for row, c in enumerate(clusters):
+            chash, path = c["medoid"], c.get("medoid_path")
+            it = QListWidgetItem(QIcon(self.thumbs.pixmap(chash, path)),
+                                 f"簇{c['cid']}·{len(c['members'])}")
+            self.listw.addItem(it)
+            self._meta[row] = (c["cid"], chash, path)
+
+    def _on_thumb(self, chash: str):
+        for row in range(self.listw.count()):
+            cid, ch, p = self._meta.get(row, (None, None, None))
+            if ch == chash:
+                self.listw.item(row).setIcon(QIcon(self.thumbs.pixmap(ch, p)))
+
+    def _merge(self):
+        cids = [self._meta[i.row()][0] for i in self.listw.selectedIndexes()]
+        if len(cids) >= 2:
+            self.mergeRequested.emit(cids)
+
+    def _split(self):
+        sel = self.listw.selectedIndexes()
+        if len(sel) == 1:
+            self.splitRequested.emit(self._meta[sel[0].row()][0])
+
+
+class HairstylePanel(QWidget):
+    """发型三模式：A 固定清单 / B 聚类(K 自动或指定) / C 示例标注；生成后一键应用为分区键。"""
+
+    runRequested = Signal(str, object, list)
+    applyRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("发型分组（SigLIP2 嵌入三模式共用）"))
+        self.mode = QComboBox()
+        self.mode.addItems(["B 嵌入聚类（推荐）", "A 固定清单零样本", "C 示例标注"])
+        v.addWidget(self.mode)
+        self.k_label = QLabel("组数 K")
+        self.k_spin = QSpinBox()
+        self.k_spin.setRange(0, 12)
+        self.k_spin.setValue(0)
+        self.k_spin.setSpecialValueText("K 自动（轮廓系数）")
+        hk = QHBoxLayout()
+        hk.addWidget(self.k_label)
+        hk.addWidget(self.k_spin)
+        v.addLayout(hk)
+        self.ex_edit = QLineEdit()
+        self.ex_edit.setPlaceholderText("示例图路径，逗号分隔")
+        self.ex_btn = QPushButton("选择示例…")
+        exh = QHBoxLayout()
+        exh.addWidget(self.ex_edit)
+        exh.addWidget(self.ex_btn)
+        v.addLayout(exh)
+        self.run_btn = QPushButton("计算发型分组")
+        v.addWidget(self.run_btn)
+        self.hint = QLabel("")
+        self.hint.setWordWrap(True)
+        v.addWidget(self.hint)
+        self.apply_btn = QPushButton("应用为分区键")
+        self.apply_btn.setEnabled(False)
+        v.addWidget(self.apply_btn)
+        v.addStretch(1)
+
+        self.ex_edit.hide()
+        self.ex_btn.hide()
+        self.mode.currentIndexChanged.connect(self._mode_changed)
+        self.ex_btn.clicked.connect(self._pick)
+        self.run_btn.clicked.connect(self._emit_run)
+        self.apply_btn.clicked.connect(self.applyRequested.emit)
+
+    def _mode_changed(self, i):
+        self.ex_edit.setVisible(i == 2)
+        self.ex_btn.setVisible(i == 2)
+        self.k_spin.setVisible(i == 0)
+        self.k_label.setVisible(i == 0)
+
+    def _pick(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择示例图", "", "图片 (*.jpg *.jpeg *.png *.webp *.bmp)")
+        if paths:
+            self.ex_edit.setText(",".join(paths))
+
+    def _emit_run(self):
+        mode = "ABC"[self.mode.currentIndex()]
+        k = self.k_spin.value() or None
+        examples = ([p.strip() for p in self.ex_edit.text().split(",") if p.strip()]
+                    if mode == "C" else [])
+        self.runRequested.emit(mode, k, examples)
+
+    def set_running(self, running: bool):
+        self.run_btn.setEnabled(not running)
+        if running:
+            self.hint.setText("计算中（嵌入缓存命中时仅模式计算）…")
+
+    def show_result(self, hs: dict):
+        sizes = sorted((len(v) for v in hs["groups"].values()), reverse=True)
+        self.hint.setText(
+            f"模式 {hs['mode']} 已生成 {len(hs['group_order'])} 组（top: {sizes[:5]}）")
+        self.apply_btn.setEnabled(True)
+
+
+class RenameDialog(QDialog):
+    """重命名：plan 前后名对照（漂移红标）→ 模式/预演选择 → 确认执行。"""
+
+    def __init__(self, cfg: Config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("批量重命名")
+        self.cfg = cfg
+        self.resize(760, 560)
+        self.plan = rename.load_plan(cfg)
+        self.conflicts = rename.check_conflicts(cfg, self.plan)
+        self.drift = {it["chash"]: d for it in self.plan["sequence"]
+                      if (d := rename._drifted(it))}
+
+        v = QVBoxLayout(self)
+        mode = cfg.rename_mode
+        banner = (f"模式 {mode}：{len(self.plan['sequence'])} 条 → "
+                  f"{rename.target_dir(cfg) if mode == 'copy' else cfg.sample_dir}")
+        if self.conflicts:
+            banner += f"　⚠ 冲突 {len(self.conflicts)} 个：{'；'.join(self.conflicts[:5])}"
+        if self.drift:
+            banner += f"　⚠ 漂移 {len(self.drift)} 条（将跳过）"
+        lab = QLabel(banner)
+        lab.setWordWrap(True)
+        if self.conflicts or self.drift:
+            lab.setStyleSheet("color:#c33")
+        v.addWidget(lab)
+
+        self.table = QTableWidget(len(self.plan["sequence"]), 2)
+        self.table.setHorizontalHeaderLabels(["原文件", "新名"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        for r, it in enumerate(self.plan["sequence"]):
+            self.table.setItem(r, 0, QTableWidgetItem(Path(it["path"]).name))
+            self.table.setItem(r, 1, QTableWidgetItem(it["new_name"]))
+            if it["chash"] in self.drift:
+                for cidx in (0, 1):
+                    self.table.item(r, cidx).setBackground(Qt.red)
+        v.addWidget(self.table, 1)
+
+        h = QHBoxLayout()
+        self.copy_rb = QRadioButton("copy 副本（默认，原包不动）")
+        self.inplace_rb = QRadioButton("inplace 改名（可回滚）")
+        (self.copy_rb if mode == "copy" else self.inplace_rb).setChecked(True)
+        self.dry_cb = QCheckBox("预演（不动文件）")
+        self.dry_cb.setChecked(True)
+        self.run_btn = QPushButton("执行")
+        self.run_btn.setEnabled(not self.conflicts)
+        h.addWidget(self.copy_rb)
+        h.addWidget(self.inplace_rb)
+        h.addWidget(self.dry_cb)
+        h.addWidget(self.run_btn)
+        v.addLayout(h)
+
+        self.run_btn.clicked.connect(self.accept)
+
+    @property
+    def chosen_mode(self) -> str:
+        return "inplace" if self.inplace_rb.isChecked() else "copy"
+
+    @property
+    def dry_run(self) -> bool:
+        return self.dry_cb.isChecked()
