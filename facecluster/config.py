@@ -25,7 +25,7 @@ class Config:
 
     # ---- 人脸（检测+识别）----
     face_pack: str = "buffalo_s"      # 本地已有；精度不足换 buffalo_l（需下载）
-    det_size: int = 0                 # 0 = 从检测模型输入 shape 自动读取
+    det_size: int = 0                 # 0 = 从检测模型输入 shape 自动读取；>0 = 强制方形边长（动态 shape 模型可用）
     use_gpu: bool = True              # DirectML；不可用时显式告警（不静默）
 
     # ---- 掩码 ----
@@ -37,8 +37,6 @@ class Config:
     hair_achroma_sat: float = 0.16    # HSV 饱和度低于此 → 无彩色（黑/灰/白）
     hair_black_L: float = 30.0        # L* 低于此 = 黑
     hair_white_L: float = 62.0        # L* 高于此 = 白
-    hue_tol: float = 15.0             # 色相置信度的容差（度）
-    skin_top_light_frac: float = 0.5  # 诊断保留：L_top 统计用
     # 肤色 0-19 级（用户需求：数字越大越深；描述词 白皮肤/黄皮肤/黑皮肤 映射区间）
     skin_level_floor: float = 44.0    # eff 分下限（eff=(100-L)+min(C,cap)*credit）
     skin_level_span: float = 48.0     # eff 跨度 [floor, floor+span] → 0..19

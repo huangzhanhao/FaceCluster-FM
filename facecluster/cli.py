@@ -26,6 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     p_ann.add_argument("--pack", default=None, help="insightface 模型包，默认 buffalo_s")
     p_ann.add_argument("--no-gpu", action="store_true")
     p_ann.add_argument("--mask", default=None, choices=["mediapipe", "off"])
+    p_ann.add_argument("--det-size", type=int, default=None,
+                       help="检测输入方形边长；默认从模型输入 shape 读取（动态 shape 模型退默认 640）")
 
     p_clu = sub.add_parser("cluster", help="M1 身份聚簇 → out/clusters.json")
     p_clu.add_argument("--thr", type=float, default=None, help="同人余弦阈值，默认 0.55")
@@ -52,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     p_fm.add_argument("--text", action="store_true",
                       help="另下文本塔 ~1.1GB（仅模式 A 提示词预计算需要）")
     p_fm.add_argument("--pack", default=None, metavar="NAME",
-                      help="下载 InsightFace 模型包并解压（识别精度升级位，如 buffalo_l、antelopev2）")
+                      help="下载 InsightFace 模型包并解压（官方 release：buffalo_s/buffalo_l/antelopev2 等）")
 
     sub.add_parser("report", help="由 annotations.jsonl 生成接触表 HTML")
 
@@ -68,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
             cfg.use_gpu = False
         if args.mask:
             cfg.mask_provider = args.mask
+        if args.det_size:
+            cfg.det_size = args.det_size
         from .annotate import annotate
 
         out = annotate(cfg, limit=args.limit)
@@ -124,8 +128,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.pack:
             pack_dir = cfg.insightface_root / "models" / args.pack
-            modelhub.download_and_unpack("public-data/insightface", f"models/{args.pack}.zip",
-                                         pack_dir, min_bytes=10_000_000)
+            modelhub.download_pack(args.pack, pack_dir)
             print(f"✓ 模型包 {args.pack} 就绪（annotate --pack {args.pack} 启用）")
             return 0
 

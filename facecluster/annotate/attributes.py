@@ -7,6 +7,8 @@ None = 无效（像素不足 / 无掩码），调用方按"弃权"处理。
 实现要点（校准踩坑记录）：
 - OpenCV 浮点色空间要求输入 0-1（L*∈[0,100]，a*/b*∈[-127,127]）；uint8 输入的
   Lab 是 0-255 且 a/b 偏移 128——两种约定混用是 v0.3 肤色失真的根源。
+- cv2 5.x 的 float32 BGR2HSV 直接给 H∈[0,360]（uint8 输入才是 [0,180]）；发色色相
+  一律按真实度数使用，不得再乘 2（×2 曾把 60° 的金黄推到 120° 绿桶）。
 - 灰世界白平衡只对"皮肤像素集"做会把皮肤色度中和成灰（a*/b*→0），禁止使用。
 - 近黑像素的 HSV 色相是噪声，暗发判棕/黑走"色相一致率"而不是色相均值本身。
 - 绝对亮度 L 与"场景位次"都无法在混合光照下区分 阴影浅肤 vs 亮光深肤
@@ -92,7 +94,7 @@ def hair_color(
         medV = float(np.median(hsv[..., 2][er]))
         if medV < cfg.dark_v_floor:
             return "黑", float((L <= cfg.hair_black_L + 10.0).mean())
-        mh, conf = _hue_stats(hsv[..., 0][er] * 2.0)
+        mh, conf = _hue_stats(hsv[..., 0][er])
         if conf >= cfg.hair_dark_conf and cfg.hair_warm_hue[0] <= mh <= cfg.hair_warm_hue[1]:
             return "棕", conf
         return "黑", conf
@@ -102,7 +104,7 @@ def hair_color(
     if medS < cfg.hair_achroma_sat:  # 无彩色：灰/白（黑已在暗发分支接住）
         bucket = "灰" if medL < cfg.hair_white_L else "白"
         return bucket, float((np.abs(L - medL) <= 10.0).mean())
-    mh, conf = _hue_stats(hsv[..., 0][er] * 2.0)
+    mh, conf = _hue_stats(hsv[..., 0][er])
     bucket = _hue_bucket(mh, medL)
     if conf < cfg.min_color_conf:
         return None, conf
@@ -277,14 +279,14 @@ def _hair_color_window(bgr: np.ndarray, bbox: list[float], cfg: Config):
         medV = float(np.median(hsv[..., 2][sel]))
         if medV < cfg.dark_v_floor:
             return "黑", float((L <= cfg.hair_black_L + 10.0).mean())
-        mh, conf = _hue_stats(hsv[..., 0][sel] * 2.0)
+        mh, conf = _hue_stats(hsv[..., 0][sel])
         if conf >= cfg.hair_dark_conf and cfg.hair_warm_hue[0] <= mh <= cfg.hair_warm_hue[1]:
             return "棕", conf
         return "黑", conf
     medS = float(np.median(hsv[..., 1][sel]))
     if medS < cfg.hair_achroma_sat:
         return ("灰" if medL < cfg.hair_white_L else "白"), float((np.abs(L - medL) <= 10.0).mean())
-    mh, conf = _hue_stats(hsv[..., 0][sel] * 2.0)
+    mh, conf = _hue_stats(hsv[..., 0][sel])
     if conf < cfg.min_color_conf:
         return None, conf
     return _hue_bucket(mh, medL), conf

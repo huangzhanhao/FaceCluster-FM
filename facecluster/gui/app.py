@@ -1,25 +1,27 @@
 # -*- coding: utf-8 -*-
-"""主窗口：左控制面板（键序/F 值｜发型｜聚簇 三选项卡）｜中央预览表｜下日志坞。
+"""主窗口：顶栏（项目/环境）｜左侧六步流程导航｜中央阶段工作区｜底部可折叠日志。
 
-任务互斥：同一时刻仅一个 Worker。键序拖拽/勾选经 300ms 防抖后自动重排
-（改键序只重算 partition，纯内存秒级）；聚簇合并/拆分与发型分组完成后自动重排。
+阶段只做界面编排；全部后台任务经 MainWindow.run 派发，单任务互斥与进度回传集中
+在此。阶段切换时按需刷新对应工作区（懒刷新，避免 30k 规模下每次切换都重建表格）。
 """
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QHeaderView, QMainWindow, QPlainTextEdit,
-    QProgressBar, QPushButton, QSplitter, QTabWidget, QTableView, QVBoxLayout,
-    QWidget,
+    QHBoxLayout, QLabel, QMainWindow, QPlainTextEdit, QProgressBar, QPushButton,
+    QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from .. import adjust, hairstyle, partition, rename
-from ..annotate import annotate
-from ..config import KEY_REGISTRY, Config
-from .panels import ClusterPanel, FValuePanel, HairstylePanel, KeyOrderPanel, RenameDialog
-from .table_model import PlanTableModel
+from ..config import Config
+from . import theme
+from .panels import StepNav
+from .stages import (
+    AnnotateStage, ClusterStage, HairstyleStage, OutputStage, PrepareStage, SortStage,
+    task_order,
+)
 from .thumbs import ThumbStore
 from .workers import Worker
 
@@ -31,75 +33,32 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cfg = Config()
         self.setWindowTitle("FaceCluster-FM")
-        self.resize(1280, 800)
+        self.resize(1360, 860)
         self.worker: Worker | None = None
+        self._ann_cache: list | None = None
+        self._paths_map: dict[str, str] | None = None
 
         self.thumbs = ThumbStore(self.cfg.out_dir, self)
-        self.model = PlanTableModel(self.thumbs, self)
 
-        # ---- 左：三选项卡 ----
-        has_hs = (self.cfg.out_dir / "hairstyle.json").is_file()
-        self.key_panel = KeyOrderPanel(list(KEY_REGISTRY) + ([HAIRSTYLE_KEY] if has_hs else []),
-                                       self.cfg.key_order)
-        self.f_panel = FValuePanel()
-        tab1 = QWidget()
-        tv = QVBoxLayout(tab1)
-        tv.addWidget(self.key_panel)
-        tv.addWidget(self.f_panel)
-        tv.addStretch(1)
+        root = QWidget()
+        root.setObjectName("Root")
+        rv = QVBoxLayout(root)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(0)
+        rv.addWidget(self._build_topbar())
 
-        self.hs_panel = HairstylePanel(self.cfg, self.thumbs)
-        self.cluster_panel = ClusterPanel(self.thumbs)
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.addWidget(self._build_nav())
+        body.addWidget(self._build_stages())
+        body.setStretchFactor(1, 1)
+        body.setSizes([190, 1170])
 
-        tabs = QTabWidget()
-        tabs.addTab(tab1, "键序")
-        tabs.addTab(self.hs_panel, "发型")
-        tabs.addTab(self.cluster_panel, "聚簇")
-
-        self.annotate_btn = QPushButton("标注(annotate)")
-        self.annotate_btn.clicked.connect(self._run_annotate)
-        self.replan_btn = QPushButton("按当前键序重排")
-        self.replan_btn.clicked.connect(self._replan)
-        self.rename_btn = QPushButton("批量重命名…")
-        self.rename_btn.clicked.connect(self._open_rename)
-        btns = QHBoxLayout()
-        btns.addWidget(self.annotate_btn)
-        btns.addWidget(self.replan_btn)
-        btns.addWidget(self.rename_btn)
-
-        left = QWidget()
-        lv = QVBoxLayout(left)
-        lv.addWidget(tabs, 1)
-        lv.addLayout(btns)
-
-        # ---- 中：预览表 ----
-        self.table = QTableView()
-        self.table.setModel(self.model)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.verticalHeader().setDefaultSectionSize(100)
-        self.table.setColumnWidth(0, 108)
-        self.table.setColumnWidth(1, 48)
-        self.table.setColumnWidth(2, 220)
-        self.table.setColumnWidth(4, 130)
-        self.table.setColumnWidth(5, 70)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.table.setAlternatingRowColors(True)
-
-        top = QSplitter(Qt.Orientation.Horizontal)
-        top.addWidget(left)
-        top.addWidget(self.table)
-        top.setStretchFactor(1, 1)
-        top.setSizes([330, 950])
-
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(2000)
         bottom = QSplitter(Qt.Orientation.Vertical)
-        bottom.addWidget(top)
-        bottom.addWidget(self.log_view)
-        bottom.setSizes([620, 180])
-        self.setCentralWidget(bottom)
+        bottom.addWidget(body)
+        bottom.addWidget(self._build_logdock())
+        bottom.setSizes([660, 180])
+        rv.addWidget(bottom, 1)
+        self.setCentralWidget(root)
 
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(220)
@@ -110,213 +69,282 @@ class MainWindow(QMainWindow):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(300)
         self._debounce.timeout.connect(self._replan)
-        self.key_panel.keysChanged.connect(self._on_keys_changed)
 
-        # 发型：运行 → 展示结果 + 组卡片；应用 → 勾选发型键（触发自动重排）
-        self.hs_panel.runRequested.connect(self._run_hairstyle)
-        self.hs_panel.applyRequested.connect(lambda: self.key_panel.ensure_key(HAIRSTYLE_KEY))
-        self.hs_panel.mergeRequested.connect(self._merge_hairstyle_groups)
-        self.hs_panel.splitRequested.connect(self._split_hairstyle_group)
+        self._refresh_all()
+        self.nav.setCurrentRow(0)
 
-        # 聚簇：合并/拆分 → worker → 刷新面板 + 自动重排
-        self.cluster_panel.mergeRequested.connect(self._merge_clusters)
-        self.cluster_panel.splitRequested.connect(self._split_cluster)
+    # ---------- 顶栏 ----------
+    def _build_topbar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("TopBar")
+        bar.setFixedHeight(50)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(16, 0, 16, 0)
+        h.setSpacing(14)
+        brand = QLabel("FaceCluster-FM")
+        brand.setProperty("role", "brand")
+        h.addWidget(brand)
+        self.chip_sample = QLabel()
+        self.chip_sample.setObjectName("Chip")
+        self.chip_out = QLabel()
+        self.chip_out.setObjectName("Chip")
+        h.addWidget(self.chip_sample)
+        h.addWidget(self.chip_out)
+        h.addStretch(1)
+        self.chip_env = QLabel()
+        self.chip_env.setObjectName("Chip")
+        h.addWidget(self.chip_env)
+        refresh = QPushButton("↻ 刷新")
+        refresh.clicked.connect(self._refresh_all)
+        h.addWidget(refresh)
+        return bar
 
-        self._load_plan()
-        self._refresh_clusters()
+    # ---------- 导航 ----------
+    def _build_nav(self) -> QWidget:
+        rail = QWidget()
+        rail.setObjectName("NavRail")
+        v = QVBoxLayout(rail)
+        v.setContentsMargins(0, 8, 0, 8)
+        v.setSpacing(6)
+        self.nav = StepNav()
+        self.nav.currentRowChanged.connect(self._on_stage)
+        v.addWidget(self.nav, 1)
+        return rail
 
-    # ---- 数据加载 ----
-    def _on_keys_changed(self, keys: list):
-        """发型键与软排序互斥：发型已作硬键时软排序无意义，禁用开关避免静默忽略。"""
-        hs_key_on = HAIRSTYLE_KEY in keys
-        cb = self.hs_panel.soft_cb
-        cb.setEnabled(not hs_key_on)
-        cb.setToolTip("发型已作为分区键，软排序不生效" if hs_key_on else "")
-        if hs_key_on and cb.isChecked():
+    # ---------- 阶段工作区 ----------
+    def _build_stages(self) -> QWidget:
+        self.stack = QStackedWidget()
+        self.prepare = PrepareStage(self)
+        self.annotate = AnnotateStage(self)
+        self.cluster = ClusterStage(self)
+        self.hairstyle = HairstyleStage(self)
+        self.sort = SortStage(self)
+        self.output = OutputStage(self)
+        for w in (self.prepare, self.annotate, self.cluster, self.hairstyle, self.sort, self.output):
+            self.stack.addWidget(w)
+        return self.stack
+
+    # ---------- 日志坞 ----------
+    def _build_logdock(self) -> QWidget:
+        dock = QWidget()
+        dock.setObjectName("LogDock")  # 独立底色，勿与顶栏混用同一 objectName
+        v = QVBoxLayout(dock)
+        v.setContentsMargins(12, 6, 12, 8)
+        v.setSpacing(6)
+        head = QHBoxLayout()
+        self.log_toggle = QPushButton("▾ 日志")
+        self.log_toggle.setFixedWidth(90)
+        self.log_toggle.clicked.connect(self._toggle_log)
+        clear = QPushButton("清空")
+        clear.clicked.connect(lambda: self.log_view.clear())
+        head.addWidget(self.log_toggle)
+        head.addStretch(1)
+        head.addWidget(clear)
+        v.addLayout(head)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(4000)
+        self.log_view.setPlaceholderText("运行日志将显示在此…")
+        self.log_view.setProperty("role", "mono")
+        self.log_view.setStyleSheet(f"font-family:{theme.MONO_FONT}; color:{theme.PALETTE['muted']};")
+        v.addWidget(self.log_view)
+        return dock
+
+    def _toggle_log(self):
+        vis = not self.log_view.isVisible()
+        self.log_view.setVisible(vis)
+        self.log_toggle.setText("▾ 日志" if vis else "▸ 日志")
+
+    def log(self, msg: str):
+        self.log_view.appendPlainText(msg)
+
+    # ---------- 阶段切换（懒刷新） ----------
+    def _on_stage(self, row: int):
+        self.stack.setCurrentIndex(row)
+        {
+            0: self.prepare.refresh_env,
+            1: self.annotate.refresh,
+            2: self.reload_clusters,
+            3: self.reload_hairstyle,
+            4: self.load_plan,
+            5: self.output.refresh,
+        }.get(row, lambda: None)()
+
+    def mark_step(self, i: int, badge: str):
+        self.nav.set_badge(i, badge)
+
+    # ---------- 项目 / 环境 ----------
+    def set_sample_dir(self, p: Path):
+        self.cfg.sample_dir = p
+        self._refresh_all(keep_log=True)
+        self.log(f"样本目录 → {p}")
+
+    def set_out_dir(self, p: Path):
+        self.cfg.out_dir = p
+        self.thumbs.dir = p / "thumbs"
+        self.thumbs.dir.mkdir(parents=True, exist_ok=True)
+        self._ann_cache = self._paths_map = None
+        self._refresh_all(keep_log=True)
+        self.log(f"输出目录 → {p}")
+
+    def _refresh_all(self, keep_log: bool = False):
+        cfg = self.cfg
+        self.chip_sample.setText(f"样本 {cfg.sample_dir.name or cfg.sample_dir} "
+                                 f"({self._sample_count()})")
+        self.chip_sample.setToolTip(str(cfg.sample_dir))
+        self.chip_out.setText(f"输出 {cfg.out_dir.name or cfg.out_dir}")
+        self.chip_out.setToolTip(str(cfg.out_dir))
+        dml = _dml_available()
+        self.chip_env.setText("● DirectML 就绪" if dml else "○ CPU 模式")
+        self.chip_env.setStyleSheet(
+            f"color:{theme.PALETTE['ok'] if dml else theme.PALETTE['warn']};")
+        self.prepare.sample_edit.setText(str(cfg.sample_dir))
+        self.prepare.out_edit.setText(str(cfg.out_dir))
+        self.prepare.refresh_env()
+        self.annotate.refresh()
+        self.reload_clusters()
+        self.reload_hairstyle()
+        self.load_plan()
+
+    def _sample_count(self) -> int:
+        recs = self.annotations()
+        return len(recs) if recs else "—"
+
+    # ---- 数据源 ----
+    def annotations(self) -> list:
+        if self._ann_cache is None:
+            try:
+                from ..cluster import load_annotations
+
+                self._ann_cache = load_annotations(self.cfg)
+            except FileNotFoundError:
+                self._ann_cache = []
+        return self._ann_cache
+
+    def chash_paths(self) -> dict[str, str]:
+        if self._paths_map is None:
+            self._paths_map = {r.content_hash: r.path for r in self.annotations()}
+        return self._paths_map
+
+    # ---- 工件刷新 ----
+    def load_plan(self):
+        pf = self.cfg.out_dir / "plan.json"
+        plan = json.loads(pf.read_text(encoding="utf-8")) if pf.is_file() else None
+        self.sort.refresh(plan)
+        if plan:
+            # 前缀点明这是磁盘上 plan.json 的快照：其键序可能还停留在上次运行的结果，
+            # 与左侧键序面板的当前勾选未必一致，不加前缀会被误读成"当前键序"。
+            self.statusBar().showMessage(
+                f"plan.json：{plan['n_items']} 条目 / {plan['n_clusters']} 簇 / 键序 "
+                f"{'→'.join(plan['key_order'])}")
+
+    def reload_clusters(self):
+        p = self.cfg.out_dir / "clusters.json"
+        if p.is_file():
+            clu = json.loads(p.read_text(encoding="utf-8"))
+            self.cluster.refresh(clu["clusters"], clu.get("tail"))
+        else:
+            self.cluster.refresh([], None)
+
+    def reload_hairstyle(self):
+        self.hairstyle.refresh()
+        items = []
+        for r in self.annotations():
+            if (r.attrs and getattr(r.attrs, "updo_suspect", False)):
+                items.append((r.content_hash, r.path))
+        self.hairstyle.show_suspects(items)
+
+    def after_clusters_changed(self):
+        """聚簇合并/拆分完成：刷新面板并重排（人工修正反映到 plan）。"""
+        self.reload_clusters()
+        self._replan()
+
+    def after_hairstyle_changed(self):
+        self.reload_hairstyle()
+        self.sort.rebuild_keys()
+        if HAIRSTYLE_KEY in self.sort.current_keys():
+            self._replan()
+
+    def apply_hairstyle_key(self):
+        """把发型纳入分区键（勾选变更经 keysChanged → 自动重排）。"""
+        self.sort.ensure_key(HAIRSTYLE_KEY)
+
+    # ---------- 键序 → 重排 ----------
+    def on_keys_changed(self, keys: list):
+        """发型键与软排序互斥：发型已作硬键时软排序无意义，禁用开关以免静默忽略。"""
+        hs_on = HAIRSTYLE_KEY in keys
+        cb = self.sort.soft_cb
+        cb.setEnabled(not hs_on)
+        cb.setToolTip("发型已作分区键，软排序不生效" if hs_on else "")
+        if hs_on and cb.isChecked():
             cb.setChecked(False)
         self._debounce.start()
 
-    def _load_plan(self):
-        pf = self.cfg.out_dir / "plan.json"
-        if not pf.is_file():
-            self.log_view.appendPlainText(
-                f"未找到 {pf}——先在命令行跑 annotate/cluster，或点\"按当前键序重排\"（需 clusters.json）")
+    def replan(self):
+        self._debounce.stop()
+        self._replan()
+
+    def _replan(self):
+        keys = self.sort.current_keys()
+        if not keys:
+            self.statusBar().showMessage("至少勾选一个分区键", 4000)
             return
-        plan = json.loads(pf.read_text(encoding="utf-8"))
-        self.model.set_plan(plan)
-        self.f_panel.refresh(plan)
-        self.statusBar().showMessage(
-            f"{plan['n_items']} 条目 / {plan['n_clusters']} 簇 / 键序 {'→'.join(plan['key_order'])}")
+        self.cfg.hairstyle_soft = self.sort.soft_cb.isChecked()
+        self.log(f"—— 分区排序：键序 {'→'.join(keys)} ——")
+        self.run(task_order, "分区排序", args=(self.cfg, keys), on_done=lambda _r: self.load_plan())
 
-    def _refresh_clusters(self):
-        p = self.cfg.out_dir / "clusters.json"
-        if p.is_file():
-            self.cluster_panel.refresh(json.loads(p.read_text(encoding="utf-8"))["clusters"])
-
-    def _chash_paths(self) -> dict[str, str]:
-        """annotations.jsonl 的 chash→path（发型组卡片/盘束疑似的缩略图来源），惰性缓存。"""
-        if not hasattr(self, "_paths_map") or self._paths_map is None:
-            self._paths_map: dict[str, str] = {}
-            jl = self.cfg.out_dir / "annotations.jsonl"
-            if jl.is_file():
-                for line in jl.read_text(encoding="utf-8").splitlines():
-                    if line.strip():
-                        d = json.loads(line)
-                        self._paths_map[d["content_hash"]] = d["path"]
-        return self._paths_map
-
-    # ---- 任务执行（单任务互斥）----
+    # ---------- 后台任务 ----------
     def _busy(self) -> bool:
-        if self.worker is not None and self.worker.isRunning():
-            self.log_view.appendPlainText("⏳ 已有任务进行中，忽略新请求")
-            return True
-        return False
+        return self.worker is not None and self.worker.isRunning()
 
-    def _run(self, fn, label: str, on_done=None):
+    def run(self, fn, label: str, args=(), on_done=None) -> bool:
         if self._busy():
-            return
+            self.log(f"⏳ 已有任务进行中，忽略「{label}」")
+            return False
         self.progress.setRange(0, 0)
         self.progress.show()
-        self.annotate_btn.setEnabled(False)
-        self.replan_btn.setEnabled(False)
-        self.rename_btn.setEnabled(False)
-        self.hs_panel.set_running(True)
-        w = Worker(fn)
+        self._set_running(True)
+        w = Worker(fn, *args)
         self.worker = w
-        w.log.connect(self.log_view.appendPlainText)
+        w.log.connect(self.log)
         w.progress.connect(self._on_progress)
         w.done.connect(lambda r: self._task_done(label, on_done, r))
         w.error.connect(self._task_error)
         w.start()
+        return True
 
-    def _on_progress(self, i, n):
+    def _set_running(self, running: bool):
+        # 每次现场遍历：刷新环境表格/重建键序面板会销毁并替换旧按钮，
+        # 缓存按钮列表会留下已析构的 C++ 包装对象（property 调用即崩溃）。
+        for b in self.findChildren(QPushButton):
+            if b.property("role") == "primary":
+                b.setEnabled(not running)
+
+    def _on_progress(self, i: int, n: int):
         self.progress.setRange(0, max(1, n))
         self.progress.setValue(i)
 
-    def _task_done(self, label, on_done, result):
+    def _task_done(self, label: str, on_done, result):
         self.progress.hide()
-        self.annotate_btn.setEnabled(True)
-        self.replan_btn.setEnabled(True)
-        self.rename_btn.setEnabled(True)
-        self.hs_panel.set_running(False)
-        self.log_view.appendPlainText(f"✓ {label}完成")
+        self._set_running(False)
+        self.log(f"✓ {label}完成")
         if on_done:
             on_done(result)
 
-    def _task_error(self, msg):
+    def _task_error(self, msg: str):
         self.progress.hide()
-        self.annotate_btn.setEnabled(True)
-        self.replan_btn.setEnabled(True)
-        self.rename_btn.setEnabled(True)
-        self.hs_panel.set_running(False)
-        self.log_view.appendPlainText(f"✗ 任务失败：{msg}")
+        self._set_running(False)
+        self.log(f"✗ 任务失败：{msg}")
         self.statusBar().showMessage(f"任务失败：{msg}", 8000)
 
-    # ---- 标注（M0，GUI 入口）----
-    def _run_annotate(self):
-        if self._busy():
-            return
-        self.log_view.appendPlainText(
-            f"—— 标注管线启动（{self.cfg.sample_dir}；有缓存的图秒过）——")
-        self._run(lambda: annotate(self.cfg), "标注",
-                  on_done=lambda _r: self._annotate_done())
 
-    def _annotate_done(self):
-        self._paths_map = None  # 新图进入 chash→path 映射，组卡片/盘束疑似重建时生效
-        self.log_view.appendPlainText("下一步：跑 cluster 重新聚簇（新图才会生效）")
+def _dml_available() -> bool:
+    try:
+        import onnxruntime as ort
 
-    # ---- 分区排序 ----
-    def _replan(self):
-        keys = self.key_panel.current_keys()
-        if not keys:
-            self.statusBar().showMessage("至少勾选一个分区键", 4000)
-            return
-        if self._busy():
-            return
-        # 软排序开关随每次重排同步（发型分组结果存在时生效）
-        self.cfg.hairstyle_soft = self.hs_panel.soft_cb.isChecked()
-        self.log_view.appendPlainText(f"—— 分区排序：键序 {'→'.join(keys)} ——")
-        self._run(lambda: partition.build(self.cfg, keys=keys), "分区排序",
-                  on_done=lambda _r: self._load_plan())
-
-    # ---- 发型 ----
-    def _run_hairstyle(self, mode: str, k, examples: list, refresh_prompts: bool):
-        if self._busy():
-            return
-        self._run(lambda: hairstyle.build(self.cfg, mode=mode, k=k, examples=examples,
-                                          refresh_prompts=refresh_prompts),
-                  "发型分组",
-                  on_done=lambda _r: self._hairstyle_done())
-
-    def _hairstyle_done(self):
-        p = self.cfg.out_dir / "hairstyle.json"
-        if p.is_file():
-            hs = json.loads(p.read_text(encoding="utf-8"))
-            self.hs_panel.set_chash_paths(self._chash_paths())
-            self.hs_panel.show_result(hs)
-            self.hs_panel.refresh_groups(hs)
-            self._show_suspects()
-
-    def _show_suspects(self):
-        """盘束疑似（updo_suspect）缩略图，与发型分组交叉核对（§4.2，不自动改判）。"""
-        items = []
-        jl = self.cfg.out_dir / "annotations.jsonl"
-        if jl.is_file():
-            for line in jl.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    d = json.loads(line)
-                    if (d.get("attrs") or {}).get("updo_suspect"):
-                        items.append((d["content_hash"], d["path"]))
-        self.hs_panel.show_suspects(items)
-
-    def _merge_hairstyle_groups(self, names: list):
-        if self._busy():
-            return
-        self._run(lambda: hairstyle.merge_groups(self.cfg, names), "合并发型组",
-                  on_done=lambda _r: self._hairstyle_done())
-
-    def _split_hairstyle_group(self, name: str):
-        if self._busy():
-            return
-        self._run(lambda: hairstyle.split_group(self.cfg, name, k=2), "拆分发型组",
-                  on_done=lambda _r: self._hairstyle_done())
-
-    # ---- 聚簇合并/拆分 ----
-    def _merge_clusters(self, cids: list):
-        if self._busy():
-            return
-        self._run(lambda: adjust.merge(self.cfg, cids), "合并簇",
-                  on_done=lambda _r: self._clusters_changed())
-
-    def _split_cluster(self, cid: int):
-        if self._busy():
-            return
-        self._run(lambda: adjust.split(self.cfg, cid, k=2), "拆分簇",
-                  on_done=lambda _r: self._clusters_changed())
-
-    def _clusters_changed(self):
-        self._refresh_clusters()
-        self._replan()
-
-    # ---- 批量重命名 ----
-    def _open_rename(self):
-        if self._busy():
-            return
-        try:
-            dlg = RenameDialog(self.cfg, self)
-        except FileNotFoundError as e:
-            self.log_view.appendPlainText(f"✗ {e}")
-            return
-        if dlg.exec() and dlg.chosen_mode:
-            mode, dry = dlg.chosen_mode, dlg.dry_run
-            self.log_view.appendPlainText(
-                f"—— 重命名（mode={mode}{'，预演' if dry else ''}）——")
-
-            def task():
-                self.cfg.rename_mode = mode
-                return rename.run(self.cfg, dry_run=dry)
-
-            self._run(task, "重命名")
+        return "DmlExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
 
 
 def main():
@@ -326,6 +354,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("FaceCluster-FM")
+    theme.apply(app)
     w = MainWindow()
     w.show()
     sys.exit(app.exec())

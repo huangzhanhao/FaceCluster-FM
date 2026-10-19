@@ -49,7 +49,9 @@ class FaceEngine:
             det_hw = _read_onnx_input_hw(p)
             if det_hw:
                 break
-        det_size = cfg.det_size if cfg.det_size else (det_hw or (640, 640))
+        # cfg.det_size 是方形边长（int），必须归一成 (h, w) 元组——动态 shape 模型也靠它
+        # 显式指定输入尺寸，不必去改模型文件
+        det_size = (cfg.det_size, cfg.det_size) if cfg.det_size else (det_hw or (640, 640))
         if det_hw is None:
             log(f"⚠ 检测模型输入为动态 shape，det_size 用默认 {det_size}；DML 可能不兼容")
 

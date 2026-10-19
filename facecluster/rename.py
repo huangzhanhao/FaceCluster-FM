@@ -31,12 +31,6 @@ def target_dir(cfg: Config) -> Path:
     return cfg.sample_dir.parent / f"{cfg.sample_dir.name}_sorted"
 
 
-def apply_natural(plan: dict) -> None:
-    """--natural：忽略 plan 内命名，按全局位次 1.jpg..N.jpg（R8 纯自然序模式）。"""
-    for it in plan["sequence"]:
-        it["new_name"] = f"{it['pos']}{Path(it['path']).suffix or '.jpg'}"
-
-
 def _drifted(it: dict) -> str | None:
     """plan 与磁盘漂移快检（size/mtime 任一不符即跳过，不动文件）。"""
     if it.get("size") is None:

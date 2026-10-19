@@ -19,7 +19,7 @@ Windows 单机离线头像包分层分类排序工具：按人脸身份聚簇 �
 
 - Windows 10/11，Python 3.12
 - GPU：任何支持 DirectML 的显卡（可选，无卡自动走 CPU）
-- 磁盘：模型约 1.5GB（视觉塔 355MB 必须；文本塔 1.1GB 仅发型模式 A 需要）
+- 磁盘：模型约 1.7GB —— 识别包 buffalo_s ~122MB（压缩）、掩码模型 16MB、SigLIP2 视觉塔 355MB + tokenizer 33MB（发型必需）、文本塔 1.1GB（仅发型模式 A 需要）
 
 ## 安装
 
@@ -30,23 +30,24 @@ python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-下载发型模型（联网一次）：
+联网一次，准备三类模型：
 
 ```powershell
-.venv\Scripts\python -m facecluster.cli fetch-model          # SigLIP2 视觉塔 ~355MB
-.venv\Scripts\python -m facecluster.cli fetch-model --text   # 文本塔 ~1.1GB，仅模式 A 需要
+.venv\Scripts\python -m facecluster.cli fetch-model --pack buffalo_s   # 识别包（官方 release，~122MB）
+.venv\Scripts\python -m facecluster.cli fetch-model                    # SigLIP2 视觉塔 ~355MB（发型必需）
+.venv\Scripts\python -m facecluster.cli fetch-model --text             # 文本塔 ~1.1GB（仅发型模式 A 需要）
 ```
 
-下载失败自动回退 hf-mirror.com 镜像；也可设 `HF_ENDPOINT` 后重试。
+- 识别包走 InsightFace 官方 release（GitHub；`--pack` 带白名单：buffalo_s / buffalo_l / antelopev2 / buffalo_m / buffalo_sc / cheetah_l / cheetah_s，其中 buffalo_l 另有 HF 兜底）；SigLIP2 走 HF（视觉塔命令同时下 `preprocessor_config.json` 与 `tokenizer.json`），下载失败自动回退 hf-mirror.com 镜像（也可设 `HF_ENDPOINT` 后重试）
+- 掩码模型没有下载入口，需手动放置：从 HF `senty-au/selfie_multiclass_256x256-ONNX` 下 `onnx/model.onnx`（16.5MB），**重命名为 `selfie_multiclass_256x256.onnx`** 放到 `~/.facecluster/models/`；缺失或 `--mask off` 时管线不中断——肤色/发色自动走无掩码回退档（脸颊+额头补丁采样、头顶几何窗口），发长标记无效
+- 检测模型若是动态 shape（官方 buffalo_s 即是），默认按 640 跑；要沿用既有基线速度，用 `annotate --det-size 352` 指定输入尺寸
 
 识别精度升级位（簇错误合并/漏聚时启用）：
 
 ```powershell
-.venv\Scripts\python -m facecluster.cli fetch-model --pack buffalo_l   # 或 antelopev2
-.venv\Scripts\python -m facecluster.cli annotate --pack buffalo_l      # 用新包重跑标注
+.venv\Scripts\python -m facecluster.cli fetch-model --pack buffalo_l
+.venv\Scripts\python -m facecluster.cli annotate --pack buffalo_l
 ```
-
-掩码模型缺失或 `--mask off` 时管线不中断：肤色/发色自动走无掩码回退档（脸颊+额头补丁采样、头顶几何窗口），发长标记无效。
 
 ## 快速开始
 
@@ -73,10 +74,19 @@ python -m venv .venv
 .venv\Scripts\python -m facecluster.gui
 ```
 
-- **键序页**：勾选/拖拽分区键，改动自动触发重排（纯内存秒级），F 值实时刷新
-- **发型页**：三模式切换（嵌入缓存共用）；模式 B 生成后以**组卡片**（代表图）呈现，多选合并 / 单选拆组，改动写入 hairstyle.json；模式 A 清单可直接编辑并重算；支持**软排序**（发型不进分区键，段内同组相邻）；盘束疑似样本与分组交叉核对
-- **聚簇页**：medoid 代表图网格，多选合并 / 单选拆分，改完自动重排
-- **批量重命名**：前后名对照表，冲突/漂移红标，copy 与 inplace 可选
+界面按管线顺序组织为**六步流程导航**，左侧步骤条即"我在第几步、哪步已完成"：
+
+- **① 准备**：选择样本/输出目录；查看识别包、掩码、SigLIP2 视觉塔/文本塔、DirectML 的
+  就绪状态并就地下载；GPU 自检；**一键全流程**（标注 → 聚簇 → 排序）
+- **② 标注**：图片上限/识别包/掩码/GPU 参数；结果概览 + 发色/肤色/发长分布条形图
+- **③ 聚簇**：调节同人阈值运行聚簇；medoid 代表图网格，多选**合并** / 单选**拆分**，改完自动重排
+- **④ 发型**：三模式切换（嵌入缓存共用）；模式 B 以**组卡片**呈现，多选合并 / 单选拆组；
+  模式 A 清单可直接编辑并重算；**软排序**开关；盘束疑似交叉核对；一键**应用为分区键**
+- **⑤ 分区排序**：键序拖拽/勾选（改动 300ms 防抖自动重排）；F 值实时刷新；预览表可搜索原名/新名/段
+- **⑥ 输出**：前后名对照（冲突/漂移红标），copy 与 inplace 可选，预演/执行/回滚；
+  生成并打开排序报告与接触表
+
+底部日志坞可折叠；后台任务单任务互斥，运行期间顶部显示进度。
 
 ## 发型三模式
 
@@ -100,7 +110,7 @@ python -m venv .venv
 .venv\Scripts\python -m facecluster.cli order --soft-hairstyle
 ```
 
-任意模式下均可手工微调组结构（GUI 组卡片合并/拆组，或直接编辑 `out/hairstyle.json` 后重排）；plan 参数指纹绑定了发型工件，工件变化后过期可检测。
+任意模式下均可手工微调组结构（GUI 组卡片合并/拆组，或直接编辑 `out/hairstyle.json` 后重排）；plan 会记录绑定发型工件的指纹（组数或手工编辑标记变化即变），但暂未接线自动过期提示。
 
 ## 数据流与工件
 
@@ -117,8 +127,8 @@ python -m venv .venv
                                      out/rename_journal.json（inplace 回滚依据）
 ```
 
-- 缓存位于 `~/.facecluster/cache/features/{内容哈希}.npz`（嵌入、掩码、发型嵌入），改名后依然命中
-- 模型位于 `~/.facecluster/models/`（SigLIP2）与 `~/.insightface/models/`（buffalo_s）
+- 缓存位于 `~/.facecluster/cache/features/{内容哈希}.json + .npz`（记录 + 嵌入/掩码/发型嵌入），改名后依然命中
+- 模型位于 `~/.facecluster/models/`（SigLIP2、掩码模型）与 `~/.insightface/models/`（buffalo_s 等识别包）
 
 ## 重命名安全机制
 
@@ -131,7 +141,7 @@ python -m venv .venv
 
 ```
 facecluster/
-├── cli.py            # CLI 入口（annotate/cluster/order/rename/hairstyle/fetch-model）
+├── cli.py            # CLI 入口（annotate/cluster/order/rename/hairstyle/fetch-model/report/gpu-check）
 ├── config.py         # 全部可调参数 + 分区键注册表
 ├── cluster.py        # M1 身份聚簇
 ├── partition.py      # M2 硬分区 + 排序
@@ -140,9 +150,9 @@ facecluster/
 ├── adjust.py         # GUI 人工合并/拆分簇
 ├── modelhub.py       # 模型下载（镜像回退）
 ├── annotate/         # M0 标注管线（人脸/掩码/属性/哈希）
-└── gui/              # PySide6 桌面端（app/workers/panels/table_model/thumbs）
-tools/                # 接触表、GPU 自检
-docs/                 # 需求定稿、M0 PoC 报告
+└── gui/              # PySide6 桌面端（app/stages/panels/theme/table_model/thumbs/workers）
+tools/                # 接触表、GPU 自检、肤色交叉核验
+docs/                 # 需求定稿、M0 PoC 报告、M1~M3 实施报告
 ```
 
 ## 调试
@@ -151,5 +161,25 @@ docs/                 # 需求定稿、M0 PoC 报告
 
 ## 已知边界
 
-- 混合光照下深浅肤色的残余混淆记录于 [docs/M0-PoC报告.md](docs/M0-PoC报告.md)，发型模式 B 的组语义需人工看图核对（GUI 聚簇页/发型预览）
+- 混合光照下深浅肤色的残余混淆记录于 [docs/M0-PoC报告.md](docs/M0-PoC报告.md)，发型模式 B 的组语义需人工看图核对（GUI ③ 聚簇页 / ④ 发型页）
 - 人工合并/拆分簇（GUI）是对当前 clusters.json 的会话级修正，重跑 `cluster` 会覆盖
+
+## 待办与升级位
+
+尚未完成的工程项：
+
+- **自动化测试**：核心纯函数补 pytest（身份聚簇、硬分区、重命名回滚、发型聚类/组编辑、无掩码回退档）
+- **依赖钉版本**：`requirements.txt` 目前只钉了 onnxruntime-directml==1.24.4，其余未钉
+- **大包压测**：3 万张量级下的标注内存、排序耗时、GUI 表格滚动实测
+- **LICENSE**：公开仓库尚无许可声明
+- **CI**：GitHub Actions 干净环境安装 + pytest
+
+触发式升级位（触发前不动）：
+
+| 升级位 | 触发条件 | 操作 |
+|---|---|---|
+| 识别包 buffalo_l / antelopev2 | 簇错误合并 / 漏聚抽查不通过 | `fetch-model --pack buffalo_l` → `annotate --pack buffalo_l` |
+| face-parsing BiSeNet-R18 @512 掩码档 | 发色桶置信度持续偏低 / 帽子污染频发 | 需另行实现 faceparsing 档；触发前主档 + 无掩码回退档已覆盖 |
+| SigLIP2 L/16、so400m | 发型组语义粒度不够 | 把 `siglip_repo` 指向同族更大的 ONNX |
+
+已决策不做：固定 shape 重导出 + IOBinding + session 池——实测已在性能预算内（SigLIP2 28ms/张、450 张嵌入 12.8s），该优化以"预算未达标"为前提，触发条件 = 目标规模实测超出预算。

@@ -15,8 +15,6 @@ import numpy as np
 from ..config import Config
 
 MODEL_NAME = "selfie_multiclass_256x256.onnx"
-_IN = "input_29"
-_OUT = "Identity"
 
 
 class MaskEngine:
@@ -86,7 +84,7 @@ class MaskEngine:
         return logits[0].argmax(-1).astype(np.uint8)
 
     def infer(self, bgr: np.ndarray, face_bbox: list[float] | None) -> dict[str, np.ndarray] | None:
-        """返回 hair / body_skin / face_skin（原图分辨率 bool）与 class_map(uint8)。"""
+        """返回 hair / face_skin（原图分辨率 bool）——属性判定只用这两类。"""
         if not self.ok:
             return None
         if self.norm is None:
@@ -100,7 +98,5 @@ class MaskEngine:
         full = cv2.resize(cls, (w, h), interpolation=cv2.INTER_NEAREST)
         return {
             "hair": full == 1,
-            "body_skin": full == 2,
             "face_skin": full == 3,
-            "class_map": full,
         }
