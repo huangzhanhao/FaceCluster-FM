@@ -26,11 +26,12 @@ class MaskEngine:
         self.ok = False
         self.norm: str | None = None
         if cfg.mask_provider != "mediapipe":
-            log("掩码引擎已关闭（mask_provider=off），属性将全部无效")
+            log("掩码引擎已关闭（mask_provider=off）——肤色/发色走无掩码回退档，发长无效")
             return
         path = cfg.models_dir / MODEL_NAME
         if not path.is_file():
-            log(f"⚠ 缺少掩码模型 {path} —— 属性将无效（可从 HF senty-au/selfie_multiclass_256x256-ONNX 下载）")
+            log(f"⚠ 缺少掩码模型 {path} —— 肤色/发色走无掩码回退档，发长无效"
+                f"（可从 HF senty-au/selfie_multiclass_256x256-ONNX 下载）")
             return
         import onnxruntime as ort
 

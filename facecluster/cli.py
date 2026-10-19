@@ -32,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p_ord = sub.add_parser("order", help="M2 硬分区+排序 → out/plan.json + 预览报告")
     p_ord.add_argument("--keys", default=None, help="逗号分隔键序，默认 肤色,发长,发色")
+    p_ord.add_argument("--soft-hairstyle", action="store_true",
+                       help="发型软排序：不改硬分区，段内同发型组相邻（需先跑 hairstyle）")
 
     p_ren = sub.add_parser("rename", help="M2 按 plan.json 批量重命名")
     p_ren.add_argument("--mode", default=None, choices=["copy", "inplace"])
@@ -49,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
     p_fm = sub.add_parser("fetch-model", help="下载 SigLIP2 视觉塔 ~355MB（联网一次）")
     p_fm.add_argument("--text", action="store_true",
                       help="另下文本塔 ~1.1GB（仅模式 A 提示词预计算需要）")
+    p_fm.add_argument("--pack", default=None, metavar="NAME",
+                      help="下载 InsightFace 模型包并解压（识别精度升级位，如 buffalo_l、antelopev2）")
 
     sub.add_parser("report", help="由 annotations.jsonl 生成接触表 HTML")
 
@@ -81,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
         from . import partition, report
 
         keys = [k.strip() for k in args.keys.split(",")] if args.keys else None
+        if args.soft_hairstyle:
+            cfg.hairstyle_soft = True
         out = partition.build(cfg, keys=keys)
         html, csv = report.build(cfg)
         print(f"输出：{out}")
@@ -115,6 +121,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "fetch-model":
         from . import modelhub
         from .hairstyle import model_dir
+
+        if args.pack:
+            pack_dir = cfg.insightface_root / "models" / args.pack
+            modelhub.download_and_unpack("public-data/insightface", f"models/{args.pack}.zip",
+                                         pack_dir, min_bytes=10_000_000)
+            print(f"✓ 模型包 {args.pack} 就绪（annotate --pack {args.pack} 启用）")
+            return 0
 
         base = model_dir(cfg)
         modelhub.download(cfg.siglip_repo, "onnx/vision_model.onnx",

@@ -55,6 +55,26 @@ def model_dir(cfg: Config) -> Path:
     return cfg.models_dir / "siglip2"
 
 
+def prompts_file(cfg: Config) -> Path:
+    """模式 A 外部清单（GUI 可增删改），存在则覆盖内置 HAIRSTYLE_PROMPTS。
+
+    放项目根而非 out/：它是用户手工维护的配置，不应随生成物目录一起被清理，
+    且可进版本库与其他环境共享。
+    """
+    from .config import PROJECT_ROOT
+
+    return PROJECT_ROOT / "hairstyle_prompts.json"
+
+
+def load_prompt_list(cfg: Config) -> list[tuple[str, list[str]]]:
+    """模式 A 类目清单：优先读外部 JSON（[{label, prompts:[...]}]），否则内置。"""
+    pf = prompts_file(cfg)
+    if pf.is_file():
+        items = json.loads(pf.read_text(encoding="utf-8"))
+        return [(d["label"], list(d["prompts"])) for d in items if d.get("label") and d.get("prompts")]
+    return HAIRSTYLE_PROMPTS
+
+
 def _session(cfg: Config, onnx_path: Path, log=print):
     """DML 会话；FP16/int8 文件名直接拒绝（DML LayerNorm 崩溃先例 + int8 不可用）。"""
     name = onnx_path.name.lower()
@@ -245,13 +265,20 @@ def load_all_hair_emb(cfg: Config, log=print) -> tuple[dict[str, np.ndarray], li
 # ---------------- 聚类工具（模式 B） ----------------
 
 def _kmeans(X: np.ndarray, k: int, iters: int = 20, seed: int = 0) -> np.ndarray:
-    """k-means++ + Lloyd，全程 float32（禁止隐式升 float64）。返回 labels。"""
+    """k-means++ + Lloyd，全程 float32（禁止隐式升 float64）。返回 labels。
+
+    退化场景：k>点数时收敛为点数；点全部重合（重复图）时 kmeans++ 的距离概率
+    全为 0 无法选种子，直接轮分标签——重复成员对聚类无信息量，任意分桶即可。
+    """
     rng = np.random.default_rng(seed)
     n = len(X)
+    k = min(k, n)
     centers = [X[rng.integers(n)].copy()]
     d2 = np.sum((X - centers[0]) ** 2, axis=1)
     for _ in range(k - 1):
-        p = d2 / max(1e-12, d2.sum())
+        if d2.sum() <= 1e-12:
+            return np.arange(n) % k
+        p = d2 / d2.sum()
         centers.append(X[rng.choice(n, p=p)].copy())
         d2 = np.minimum(d2, np.sum((X - centers[-1]) ** 2, axis=1))
     C = np.stack(centers)
@@ -347,8 +374,9 @@ def build(
 
 def _mode_a(cfg: Config, embs: dict[str, np.ndarray], refresh: bool, log=print):
     """固定清单零样本。提示词嵌入预计算进 text_prompts.npz，运行时不加载 text_model。"""
-    prompts = [p for _, ps in HAIRSTYLE_PROMPTS for p in ps]
-    labels = [lab for lab, _ in HAIRSTYLE_PROMPTS]
+    prompt_list = load_prompt_list(cfg)
+    prompts = [p for _, ps in prompt_list for p in ps]
+    labels = [lab for lab, _ in prompt_list]
     pf = model_dir(cfg) / "text_prompts.npz"
     key = stable_hash(prompts=prompts).encode()
     E = None
@@ -364,7 +392,7 @@ def _mode_a(cfg: Config, embs: dict[str, np.ndarray], refresh: bool, log=print):
     X = np.stack([embs[c] for c in sorted(embs)])
     sims = X @ E.T  # n×prompt
     pi = sims.argmax(1)
-    prompt_label = [lab for lab, ps in HAIRSTYLE_PROMPTS for _ in ps]
+    prompt_label = [lab for lab, ps in prompt_list for _ in ps]
     groups: dict[str, list[str]] = {}
     chashes = sorted(embs)
     for c, j in zip(chashes, pi):
@@ -378,14 +406,19 @@ def _mode_b(embs: dict[str, np.ndarray], k: int | None, log=print):
     X = np.stack([embs[c] for c in sorted(embs)]).astype(np.float32)
     chashes = sorted(embs)
     if k is None:
-        best, best_k, best_s = None, 2, -2.0
-        for kk in range(2, min(12, len(X) - 1) + 1):
-            s = _silhouette(X, _kmeans(X, kk))
-            log(f"  K={kk} 轮廓系数 {s:.3f}")
-            if s > best_s:
-                best, best_k, best_s = kk, kk, s
-        k = best_k
-        log(f"自动选 K={k}（轮廓系数 {best_s:.3f}）")
+        hi = min(12, len(X) - 1)
+        if hi < 2:
+            k = 1  # 仅 1 个有效嵌入时无法聚类，单组即可
+            log("  有效嵌入仅 1 张，K=1")
+        else:
+            best, best_k, best_s = None, 2, -2.0
+            for kk in range(2, hi + 1):
+                s = _silhouette(X, _kmeans(X, kk))
+                log(f"  K={kk} 轮廓系数 {s:.3f}")
+                if s > best_s:
+                    best, best_k, best_s = kk, kk, s
+            k = best_k
+            log(f"自动选 K={k}（轮廓系数 {best_s:.3f}）")
     labels = _kmeans(X, k)
     groups: dict[str, list[str]] = {}
     for c, lb in zip(chashes, labels):
@@ -426,3 +459,78 @@ def _mode_c(cfg: Config, embs: dict[str, np.ndarray], examples: list[str], log=p
     for c, j in zip(chashes, which):
         groups[anchors[j][0]].append(c)
     return groups, [name for name, _ in anchors]
+
+
+# ---------------- 手工组编辑（GUI 看图合并/拆组，§4.3 模式 B 工作流） ----------------
+
+def _load_hs(cfg: Config) -> tuple[dict, Path]:
+    art = cfg.out_dir / "hairstyle.json"
+    if not art.is_file():
+        raise FileNotFoundError(f"先运行 hairstyle 生成 {art}")
+    return json.loads(art.read_text(encoding="utf-8")), art
+
+
+def _write_hs(cfg: Config, hs: dict, art: Path) -> None:
+    hs["manual_edits"] = True  # 手工编辑标记：进 plan 漂移指纹，组数/标志变化即被捕捉
+    art.write_text(json.dumps(hs, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def merge_groups(cfg: Config, names: list[str], log=print) -> Path:
+    """把 names[1:] 的成员并入 names[0]；对任意模式的分组结果有效。"""
+    if len(names) < 2:
+        raise ValueError("合并至少需要两个组")
+    hs, art = _load_hs(cfg)
+    groups, order = hs["groups"], hs["group_order"]
+    missing = [n for n in names if n not in groups]
+    if missing:
+        raise ValueError(f"组不存在: {missing}")
+    keep = names[0]
+    for n in names[1:]:
+        groups[keep].extend(groups.pop(n))
+        order.remove(n)
+    _write_hs(cfg, hs, art)
+    log(f"✓ 合并 {names} → {keep}（{len(groups[keep])} 图）；现 {len(order)} 组")
+    return art
+
+
+def split_group(cfg: Config, name: str, k: int = 2, log=print) -> Path:
+    """按发型嵌入对组做 k-means 拆分（默认 2），新组名 = 原名·1/2…，组序位置不变。"""
+    hs, art = _load_hs(cfg)
+    if name not in hs["groups"]:
+        raise ValueError(f"组不存在: {name}")
+    members = hs["groups"][name]
+    if len(members) < k:
+        raise ValueError(f"组 {name} 仅 {len(members)} 图，无法拆成 {k} 组")
+    embs_map: dict[str, np.ndarray] = {}
+    for m in members:
+        v = load_array(cfg.cache_root, m, "hair_emb")
+        if v is not None:
+            embs_map[m] = v
+    chashes = sorted(embs_map)
+    if not chashes:
+        raise ValueError(f"组 {name} 成员均无发型嵌入缓存（重跑 hairstyle 或 annotate 后再拆）")
+    labels = _kmeans(np.stack([embs_map[c] for c in chashes]).astype(np.float32), k)
+    new_names = [f"{name}·{i + 1}" for i in range(k)]
+    hs["groups"].pop(name)
+    for i, nn in enumerate(new_names):
+        hs["groups"][nn] = [c for c, lb in zip(chashes, labels) if lb == i]
+    leftovers = [m for m in members if m not in embs_map]  # 无嵌入成员归末组
+    hs["groups"][new_names[-1]].extend(leftovers)
+    idx = hs["group_order"].index(name)
+    hs["group_order"][idx:idx + 1] = new_names
+    _write_hs(cfg, hs, art)
+    sizes = [len(hs["groups"][nn]) for nn in new_names]
+    log(f"✓ 拆分 {name}（{len(members)} 图）→ {dict(zip(new_names, sizes))}；现 {len(hs['group_order'])} 组")
+    return art
+
+
+def representative_chashes(cfg: Config, chashes: list[str], n: int = 3) -> list[str]:
+    """取组内最接近组中心的前 n 张作代表图（GUI 组卡片展示用）。"""
+    embs = [load_array(cfg.cache_root, c, "hair_emb") for c in chashes]
+    pairs = [(c, e) for c, e in zip(chashes, embs) if e is not None]
+    if len(pairs) <= n:
+        return [c for c, _ in pairs] + [c for c in chashes if c not in {p[0] for p in pairs}]
+    X = np.stack([e for _, e in pairs])
+    center = X.mean(axis=0)
+    order = np.argsort(-(X @ center))
+    return [pairs[i][0] for i in order[:n]]

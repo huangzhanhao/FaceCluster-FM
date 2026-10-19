@@ -232,3 +232,85 @@ def compute_attributes(
     attrs.censored = cen
     attrs.updo_suspect = updo
     return attrs
+
+
+# ---------------- 无掩码回退（§4.1：解析完全不可用时降级，功能不中断） ----------------
+
+def _patch_stats(lab: np.ndarray, x1: int, y1: int, x2: int, y2: int):
+    """矩形补丁的 (L*, C*) 中位数；区域过小返回 None。"""
+    h, w = lab.shape[:2]
+    a, b = max(0, x1), min(w, x2)
+    c, d = max(0, y1), min(h, y2)
+    if b - a < 4 or d - c < 4:
+        return None
+    cell = lab[c:d, a:b]
+    return float(np.median(cell[..., 0])), float(np.median(np.hypot(cell[..., 1], cell[..., 2])))
+
+
+def _level_from_eff(medL: float, medC: float, cfg: Config) -> tuple[int, str]:
+    eff = (100.0 - medL) + min(medC, cfg.skin_chroma_cap) * cfg.skin_chroma_credit
+    level = max(0, min(19, int(round((eff - cfg.skin_level_floor) / cfg.skin_level_span * 19.0))))
+    lo, hi = cfg.skin_word_ranges
+    return level, ("白皮肤" if level <= lo else ("黄皮肤" if level <= hi else "黑皮肤"))
+
+
+def _hair_color_window(bgr: np.ndarray, bbox: list[float], cfg: Config):
+    """发色回退：脸框上方几何窗口（排除脸框内像素防皮肤污染）。帽子/背景污染是已知短板。"""
+    img01 = bgr.astype(np.float32) / 255.0
+    hsv = cv2.cvtColor(img01, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(img01, cv2.COLOR_BGR2Lab)
+    h, w = bgr.shape[:2]
+    x1, y1, x2, y2 = bbox
+    H = max(1.0, y2 - y1)
+    W = max(1.0, x2 - x1)
+    sel = np.zeros((h, w), bool)
+    sel[max(0, int(y1 - 0.9 * H)):min(h, int(y1 + 0.05 * H)),
+        max(0, int(x1 + 0.1 * W)):min(w, int(x2 - 0.1 * W))] = True
+    sel[max(0, int(y1)):min(h, int(y2)), max(0, int(x1)):min(w, int(x2))] = False
+    if int(sel.sum()) < 64:
+        return None, 0.0
+    L = lab[..., 0][sel]
+    medL = float(np.median(L))
+    if medL < cfg.hair_black_L:
+        return "黑", float((L <= cfg.hair_black_L + 10.0).mean())
+    if medL < cfg.hair_dark_L:
+        medV = float(np.median(hsv[..., 2][sel]))
+        if medV < cfg.dark_v_floor:
+            return "黑", float((L <= cfg.hair_black_L + 10.0).mean())
+        mh, conf = _hue_stats(hsv[..., 0][sel] * 2.0)
+        if conf >= cfg.hair_dark_conf and cfg.hair_warm_hue[0] <= mh <= cfg.hair_warm_hue[1]:
+            return "棕", conf
+        return "黑", conf
+    medS = float(np.median(hsv[..., 1][sel]))
+    if medS < cfg.hair_achroma_sat:
+        return ("灰" if medL < cfg.hair_white_L else "白"), float((np.abs(L - medL) <= 10.0).mean())
+    mh, conf = _hue_stats(hsv[..., 0][sel] * 2.0)
+    if conf < cfg.min_color_conf:
+        return None, conf
+    return _hue_bucket(mh, medL), conf
+
+
+def compute_attributes_fallback(bgr: np.ndarray, face_bbox: list[float] | None, cfg: Config) -> Attributes:
+    """无掩码回退档：肤色 = 左右脸颊 + 额头补丁采样；发色 = 头顶几何窗口；
+    发长依赖掩码量测，回退下标记无效（不猜测）。输出置信度与主档同公式。"""
+    attrs = Attributes()
+    if face_bbox is None:
+        return attrs
+    img01 = bgr.astype(np.float32) / 255.0
+    lab = cv2.cvtColor(img01, cv2.COLOR_BGR2Lab)
+    x1, y1, x2, y2 = face_bbox
+    H = max(1.0, y2 - y1)
+    W = max(1.0, x2 - x1)
+    patches = [
+        (int(x1 + 0.15 * W), int(y1 + 0.35 * H), int(x1 + 0.38 * W), int(y1 + 0.55 * H)),
+        (int(x2 - 0.38 * W), int(y1 + 0.35 * H), int(x2 - 0.15 * W), int(y1 + 0.55 * H)),
+        (int(x1 + 0.30 * W), int(y1 + 0.02 * H), int(x2 - 0.30 * W), int(y1 + 0.20 * H)),
+    ]
+    stats = [s for s in (_patch_stats(lab, *p) for p in patches) if s]
+    if stats:
+        medL = float(np.median([s[0] for s in stats]))
+        medC = float(np.median([s[1] for s in stats]))
+        attrs.skin_level, attrs.skin_word = _level_from_eff(medL, medC, cfg)
+    hc, conf = _hair_color_window(bgr, face_bbox, cfg)
+    attrs.hair_color, attrs.hair_color_conf = hc, conf
+    return attrs

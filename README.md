@@ -13,7 +13,7 @@ Windows 单机离线头像包分层分类排序工具：按人脸身份聚簇 �
 | M0 标注管线 | 人脸检测+识别、发区/皮肤掩码、三属性（发色/肤色 0-19 级/发长）、pHash | `annotate` / `report` |
 | M1 身份聚簇 | 代表点法聚簇（防传递串簇）、medoid、簇属性众数、坏脸门控落尾 | `cluster` |
 | M2 分区排序 | 键序层级硬分区、段内贪心最近邻链、F 值报告、批量重命名 | `order` / `rename` |
-| M3 发型+GUI | SigLIP2 嵌入三模式（固定清单/聚类/示例标注）+ 桌面端 | `hairstyle` / `gui` |
+| M3 发型+GUI | SigLIP2 嵌入三模式（固定清单/聚类/示例标注）、组看图编辑、软排序 + 桌面端 | `hairstyle` / `gui` |
 
 ## 环境要求
 
@@ -38,6 +38,15 @@ python -m venv .venv
 ```
 
 下载失败自动回退 hf-mirror.com 镜像；也可设 `HF_ENDPOINT` 后重试。
+
+识别精度升级位（簇错误合并/漏聚时启用）：
+
+```powershell
+.venv\Scripts\python -m facecluster.cli fetch-model --pack buffalo_l   # 或 antelopev2
+.venv\Scripts\python -m facecluster.cli annotate --pack buffalo_l      # 用新包重跑标注
+```
+
+掩码模型缺失或 `--mask off` 时管线不中断：肤色/发色自动走无掩码回退档（脸颊+额头补丁采样、头顶几何窗口），发长标记无效。
 
 ## 快速开始
 
@@ -65,7 +74,7 @@ python -m venv .venv
 ```
 
 - **键序页**：勾选/拖拽分区键，改动自动触发重排（纯内存秒级），F 值实时刷新
-- **发型页**：三模式切换（嵌入缓存共用），一键应用为分区键
+- **发型页**：三模式切换（嵌入缓存共用）；模式 B 生成后以**组卡片**（代表图）呈现，多选合并 / 单选拆组，改动写入 hairstyle.json；模式 A 清单可直接编辑并重算；支持**软排序**（发型不进分区键，段内同组相邻）；盘束疑似样本与分组交叉核对
 - **聚簇页**：medoid 代表图网格，多选合并 / 单选拆分，改完自动重排
 - **批量重命名**：前后名对照表，冲突/漂移红标，copy 与 inplace 可选
 
@@ -79,11 +88,19 @@ python -m venv .venv
 | B 嵌入聚类（默认） | k-means++，K 自动按轮廓系数（2~12）搜索 | 不确定有哪几类发型 |
 | C 示例标注 | 给几张示例图，其余按最近锚点分配 | 想完全自定义组语义 |
 
-生成 `out/hairstyle.json` 后，把「发型」加入分区键即可参与排序（GUI 中一键应用，或 CLI）：
+生成 `out/hairstyle.json` 后把「发型」加入分区键即可参与排序（GUI 一键应用，或 CLI）：
 
 ```powershell
 .venv\Scripts\python -m facecluster.cli order --keys 肤色,发长,发型
 ```
+
+不想让发型参与硬分区时，可用**软排序权重**——不改硬分区段路径，仅让段内同发型组的簇相邻：
+
+```powershell
+.venv\Scripts\python -m facecluster.cli order --soft-hairstyle
+```
+
+任意模式下均可手工微调组结构（GUI 组卡片合并/拆组，或直接编辑 `out/hairstyle.json` 后重排）；plan 参数指纹绑定了发型工件，工件变化后过期可检测。
 
 ## 数据流与工件
 

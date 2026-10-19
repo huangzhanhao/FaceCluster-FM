@@ -20,14 +20,17 @@ def build(cfg: Config) -> tuple[Path, Path]:
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     seq = plan["sequence"]
 
-    # 属性列回查（plan 不冗余存属性）
+    # 属性列回查（plan 不冗余存属性）；整图 pHash 供完全重复标记（§6：删否由用户手动）
     attrs_by_chash: dict[str, dict] = {}
+    phash_by_chash: dict[str, str] = {}
     jsonl = cfg.out_dir / "annotations.jsonl"
     if jsonl.is_file():
         for line in jsonl.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 d = json.loads(line)
                 attrs_by_chash[d["content_hash"]] = d.get("attrs") or {}
+                if d.get("whole_phash"):
+                    phash_by_chash[d["content_hash"]] = d["whole_phash"]
 
     # ---- CSV：全序列（pos, 簇, 段, 原名, 新名, 相似度） ----
     csv_path = cfg.out_dir / "sort_plan.csv"
@@ -65,6 +68,25 @@ def build(cfg: Config) -> tuple[Path, Path]:
         parts.append(f"<tr><td>{w['sim']}</td><td>{_esc(Path(w['a']).name)}</td>"
                      f"<td>{_esc(Path(w['b']).name)}</td></tr>")
     parts.append("</table>")
+
+    # ---- 完全重复（整图 pHash 相同；§6：不做删除，标记后由用户手动处理） ----
+    dup_groups: dict[str, list[str]] = {}
+    for it in seq:
+        ph = phash_by_chash.get(it["chash"])
+        if ph:
+            dup_groups.setdefault(ph, []).append(it["path"])
+    dups = [ps for ps in dup_groups.values() if len(ps) > 1]
+    parts.append(f"<h2>完全重复（整图 pHash 相同，{len(dups)} 组）</h2>")
+    if dups:
+        for ps in dups:
+            parts.append("<div class='g'>")
+            for p in ps:
+                src = Path(p).resolve().as_posix()
+                parts.append(f"<div class='c'><img src='file:///{src}' loading='lazy'>"
+                             f"<small>{_esc(Path(p).name)}</small></div>")
+            parts.append("</div>")
+    else:
+        parts.append("<p>无</p>")
 
     parts.append("<h2>输出序列（按段）</h2>")
     cur_seg = None

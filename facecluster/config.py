@@ -82,6 +82,7 @@ class Config:
     hairstyle_k: int | None = None    # 模式 B 组数；None = 轮廓系数自动（[2,12]）
     hair_mask_thr: float = 0.5        # 发区掩码二值化阈值（缓存掩码为 0/1，取 1 的像素）
     siglip_repo: str = "onnx-community/siglip2-base-patch16-224-ONNX"
+    hairstyle_soft: bool = False      # True = 发型作软排序权重：不改硬分区，仅段内同组相邻
 
 
 # ---- 属性键注册表：键名 → (从 Attributes 取值的函数, 桶次序) ----

@@ -15,7 +15,7 @@ from ..config import Config
 from ..io import content_hash, load_bgr, scan_images
 from ..types import Attributes, FaceInfo, ImageRecord
 from . import hashing
-from .attributes import compute_attributes
+from .attributes import compute_attributes, compute_attributes_fallback
 from .face import FaceEngine
 from .masks import MaskEngine
 
@@ -60,9 +60,13 @@ def _annotate_one(
         t_mask = (time.perf_counter() - t0) * 1000
 
         t0 = time.perf_counter()
-        rec.attrs = compute_attributes(
-            bgr, masks, face.bbox if face else None, cfg, face.kps if face else None
-        )
+        if masks is not None:
+            rec.attrs = compute_attributes(
+                bgr, masks, face.bbox if face else None, cfg, face.kps if face else None
+            )
+        else:
+            # 无掩码回退（§4.1）：肤色/发色走几何采样降级，发长标记无效，功能不中断
+            rec.attrs = compute_attributes_fallback(bgr, face.bbox if face else None, cfg)
         t_attr = (time.perf_counter() - t0) * 1000
 
         t0 = time.perf_counter()
@@ -151,6 +155,6 @@ def _summary(records: list[ImageRecord], n_cache: int, elapsed: float, log) -> N
     noface = sum(1 for r in records if r.face is None and not r.unread)
     unread = sum(1 for r in records if r.unread)
     log(f"  有脸 {n - noface - unread} / 无人脸 {noface} / 失败 {unread}")
-    for key, title in (("hair_color", "发色"), ("skin_tone", "肤色"), ("hair_length", "发长")):
+    for key, title in (("hair_color", "发色"), ("skin_word", "肤色"), ("hair_length", "发长")):
         c = Counter(getattr(r.attrs, key) or "无效" for r in records if not r.unread)
         log(f"  {title}: {dict(c.most_common())}")

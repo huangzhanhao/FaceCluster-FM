@@ -66,3 +66,23 @@ def download(repo: str, file: str, dest: Path, log=print, min_bytes: int = 1 << 
         f"  源：{OFFICIAL}/{repo} （国内可换 {MIRROR}/{repo}）\n"
         f"  或设环境变量 HF_ENDPOINT=https://hf-mirror.com 后重试"
     )
+
+
+def download_and_unpack(repo: str, file: str, unpack_dir: Path, log=print,
+                        min_bytes: int = 1 << 20) -> Path:
+    """下载 zip → 解压到 unpack_dir → 删 zip（模型包类工件，如 insightface buffalo_l）。"""
+    import zipfile
+
+    zf = download(repo, file, unpack_dir.parent / Path(file).name, log, min_bytes)
+    unpack_dir.mkdir(parents=True, exist_ok=True)
+    root = unpack_dir.resolve()
+    with zipfile.ZipFile(zf) as z:
+        for m in z.namelist():
+            # is_relative_to 按路径段判定：startswith 字符串比较会被 buffalo_l_evil
+            # 这类同名前缀兄弟目录绕过（绝对路径/../ 同理拦在 root 之外）
+            if not (unpack_dir / m).resolve().is_relative_to(root):
+                raise ValueError(f"zip 内非法路径（疑似路径穿越）: {m}")
+        z.extractall(unpack_dir)
+    zf.unlink()
+    log(f"✓ 已解压 → {unpack_dir}")
+    return unpack_dir

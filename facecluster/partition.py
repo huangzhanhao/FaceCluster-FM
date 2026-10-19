@@ -93,11 +93,12 @@ def _hamming(a: str | None, b: str | None) -> int:
     return bin(int(a, 16) ^ int(b, 16)).count("1")
 
 
-def _overlay_hairstyle(cfg: Config, clu: dict, log=print) -> None:
+def _overlay_hairstyle(cfg: Config, clu: dict, log=print) -> dict:
     """发型键叠加：hairstyle.json 的图级标签 → 簇级众数（并列取组序靠前者）。
 
     簇内无任何有效标签的簇 attrs["发型"]=None，自然落入"属性无效"段（R4 尾部规则）。
     必须在 KEY_REGISTRY 校验前调用——"发型"是运行时注册键。
+    返回 hairstyle.json 数据（供 plan 参数指纹绑定，防止发型工件过期后 plan 静默漂移）。
     """
     art = cfg.out_dir / "hairstyle.json"
     if not art.is_file():
@@ -117,6 +118,67 @@ def _overlay_hairstyle(cfg: Config, clu: dict, log=print) -> None:
         c["attrs"]["发型"] = cands[0] if cands else min(cnt, key=cnt.get)
     log(f"发型键已叠加：{sum(1 for c in clu['clusters'] if c['attrs']['发型'])}"
         f"/{len(clu['clusters'])} 簇有效（来自 {art.name}）")
+    return hs
+
+
+def _hairstyle_stamp(hs: dict) -> str:
+    """发型工件漂移指纹：生成参数 + 组数 + 是否手工编辑过（合并/拆组改变组数必被捕捉）。"""
+    return (f"{hs.get('config_hash')}:{len(hs.get('group_order') or [])}"
+            f":{'M' if hs.get('manual_edits') else ''}")
+
+
+def _soft_hairstyle_tags(cfg: Config, clu: dict, log=print) -> tuple[dict[int, str] | None, str | None]:
+    """软排序（§4.3）：发型不进硬分区键，仅作段内排序权重——同发型组的簇相邻。
+
+    返回 (cid → 发型组名, 发型工件指纹)；无工件时 (None, None) 并提示。
+    """
+    art = cfg.out_dir / "hairstyle.json"
+    if not art.is_file():
+        log("⚠ 软排序需先运行 hairstyle 生成 hairstyle.json；本次忽略软排序")
+        return None, None
+    hs = json.loads(art.read_text(encoding="utf-8"))
+    tag = {c: g for g, ms in hs["groups"].items() for c in ms}
+    order = hs["group_order"]
+    tags: dict[int, str] = {}
+    for c in clu["clusters"]:
+        vals = [tag[m] for m in c["members"] if m in tag]
+        if not vals:
+            continue
+        cnt = Counter(vals)
+        top = max(cnt.values())
+        cands = [g for g in order if cnt.get(g, 0) == top]
+        tags[c["cid"]] = cands[0] if cands else min(cnt, key=cnt.get)
+    log(f"发型软排序生效：{len(tags)}/{len(clu['clusters'])} 簇有发型标签"
+        f"（不改硬分区，段内同组相邻）")
+    return tags, _hairstyle_stamp(hs)
+
+
+def _chain_hairstyle(clusters: list[dict], tags: dict[int, str],
+                     med_emb: dict[int, np.ndarray], med_det: dict[int, float],
+                     prev_last: int | None) -> list[int]:
+    """软排序链：段内先按发型组分桶，组间与组内各走贪心最近邻链，无标签桶排最后。"""
+    buckets: dict[str, list[int]] = {}
+    for c in clusters:
+        buckets.setdefault(tags.get(c["cid"]) or "", []).append(c["cid"])
+    keys = sorted(buckets, key=lambda g: (g == "", g))
+    reps = {g: np.mean([med_emb[c] for c in buckets[g] if c in med_emb], axis=0)
+            for g in keys if any(c in med_emb for c in buckets[g])}
+    if not reps:
+        return [c["cid"] for c in clusters]
+    start_group = next((g for g in keys if prev_last in buckets[g]), None) if prev_last else None
+    if start_group is None or start_group not in reps:
+        start_group = max(reps, key=lambda g: sum(med_det.get(c, 0.0) for c in buckets[g]))
+    group_seq = _chain(reps, start_group) + [g for g in keys if g not in reps]
+    out: list[int] = []
+    for g in group_seq:
+        me = {c: med_emb[c] for c in buckets[g] if c in med_emb}
+        if not me:
+            out.extend(buckets[g])
+            continue
+        s = prev_last if (g == start_group and prev_last in me) \
+            else max(me, key=lambda c: med_det.get(c, 0.0))
+        out.extend(_chain(me, s))
+    return out
 
 
 def build(cfg: Config, keys: list[str] | None = None, log=print) -> Path:
@@ -124,8 +186,12 @@ def build(cfg: Config, keys: list[str] | None = None, log=print) -> Path:
     t0 = time.perf_counter()
     keys = list(cfg.key_order if keys is None else keys)
     clu, by_chash, embs = _load_plan_inputs(cfg, log)
+    hs_data: dict | None = None
     if "发型" in keys:
-        _overlay_hairstyle(cfg, clu, log)  # 注册"发型"键 + 簇属性覆盖，须在校验前
+        hs_data = _overlay_hairstyle(cfg, clu, log)  # 注册"发型"键 + 簇属性覆盖，须在校验前
+    soft_tags, soft_stamp = (None, None)
+    if cfg.hairstyle_soft and "发型" not in keys:
+        soft_tags, soft_stamp = _soft_hairstyle_tags(cfg, clu, log)
     for k in keys:
         if k not in KEY_REGISTRY:
             raise ValueError(f"未知分区键 {k}（可用：{list(KEY_REGISTRY)}；发型键需先跑 hairstyle）")
@@ -164,7 +230,8 @@ def build(cfg: Config, keys: list[str] | None = None, log=print) -> Path:
         for c in clu["clusters"]
     }
 
-    # 段排序：段内贪心链；起点 = 首段取检测分最高，其余衔接上一段末簇
+    # 段排序：段内贪心链；起点 = 首段取检测分最高，其余衔接上一段末簇；
+    # 软排序开启时段内改为"发型组分桶分层链"（§4.3 软排序权重）
     ordered_segs: list[dict] = []
     prev_last: int | None = None
     for s in segs:
@@ -174,7 +241,12 @@ def build(cfg: Config, keys: list[str] | None = None, log=print) -> Path:
             ordered_segs.append({**s, "order": cids, "chain": False})
             continue
         start = prev_last if (prev_last in me) else max(me, key=lambda c: med_det.get(c, 0.0))
-        ordered_segs.append({**s, "order": _chain(me, start), "chain": True})
+        if soft_tags:
+            ordered_segs.append({**s, "order": _chain_hairstyle(s["clusters"], soft_tags,
+                                                                med_emb, med_det, prev_last),
+                                 "chain": True})
+        else:
+            ordered_segs.append({**s, "order": _chain(me, start), "chain": True})
         prev_last = ordered_segs[-1]["order"][-1]
 
     # 属性无效段：簇间也走链，保持人相邻
@@ -299,6 +371,8 @@ def build(cfg: Config, keys: list[str] | None = None, log=print) -> Path:
         "config_hash": stable_hash(
             keys=keys, natural=cfg.natural_order, rename_mode=cfg.rename_mode,
             cluster_hash=clu["config_hash"],
+            # 发型工件漂移指纹：发型作硬键或软排序时，工件重跑/手工编辑后 plan 即提示过期
+            hairstyle_stamp=(_hairstyle_stamp(hs_data) if hs_data else soft_stamp),
         ),
         "key_order": keys,
         # 无脸尾段自身占一个簇号（命名 {cid}-i），计入 N 才满足 R4 簇号连续 1..N
